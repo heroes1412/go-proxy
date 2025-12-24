@@ -102,7 +102,9 @@ func logWithLevel(level, format string, v ...interface{}) {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   TCP PROXY - PRODUCTION ULTIMATE 2025")
+	fmt.Println("   GO PROXY - PRODUCTION ULTIMATE 2025")
+    fmt.Println("   https://github.com/heroes1412/go-proxy")
+    fmt.Println("   hoang92bn@gmail.com                   ")
 	fmt.Println("===========================================")
 
 	initTemplate()
