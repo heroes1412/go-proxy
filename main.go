@@ -43,11 +43,9 @@ type ProxyService struct {
 	Listener     net.Listener
 	quit         chan bool
 	CurrentConns int64
-	// --- CÁC BẢN CỐ ĐỊNH CỤC BỘ ---
-	IPMap        sync.Map // Giới hạn kết nối đồng thời (MaxConnsPerIP)
-	PenaltyBox   sync.Map // Danh sách cấm tạm thời của riêng Port này
-	RateMap      sync.Map // Bộ đếm tần suất của riêng Port này
-	// ---------------------------
+	IPMap        sync.Map
+	PenaltyBox   sync.Map
+	RateMap      sync.Map
 	mux          sync.RWMutex
 }
 
@@ -88,24 +86,65 @@ var (
 	appCPUUsage uint64
 	sysCPUUsage uint64
 	sysRAMUsage uint64
+
+	logMutex sync.Mutex // Đảm bảo ghi file log không bị chồng chéo
 )
 
 var bufPool = sync.Pool{
 	New: func() interface{} { return make([]byte, 32*1024) },
 }
 
-// --- LOGGERS ---
-func infoLog(format string, v ...interface{}) { logWithLevel("INFO", format, v...) }
-func warnLog(format string, v ...interface{}) { logWithLevel("WARN", format, v...) }
-func errLog(format string, v ...interface{})  { logWithLevel("ERROR", format, v...) }
-func logWithLevel(level, format string, v ...interface{}) {
+// --- LOGGING SYSTEM WITH AUTO-OVERRIDE (1MB) ---
+
+func writeToLogFile(fileName, level, format string, v ...interface{}) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	// 1. Tạo folder logs nếu chưa có
+	os.MkdirAll("logs", 0755)
+	path := fmt.Sprintf("logs/%s", fileName)
+
+	// 2. Kiểm tra dung lượng file
+	if info, err := os.Stat(path); err == nil {
+		if info.Size() > 1024*1024 { // 1MB
+			// Override file nếu quá lớn
+			os.OpenFile(path, os.O_TRUNC|os.O_WRONLY, 0644)
+		}
+	}
+
+	// 3. Mở file để ghi (Append)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	// 4. Định dạng log
 	t := time.Now().Format("15:04:05 02/01/2006")
-	fmt.Printf("[%s] [%s] "+format+"\n", append([]interface{}{t, level}, v...)...)
+	msg := fmt.Sprintf("[%s] [%s] "+format+"\n", append([]interface{}{t, level}, v...)...)
+
+	// Ghi ra Console và File
+	fmt.Print(msg)
+	f.WriteString(msg)
 }
+
+// Global logs (system.log)
+func infoLog(format string, v ...interface{}) { writeToLogFile("system.log", "INFO", format, v...) }
+func errLog(format string, v ...interface{})  { writeToLogFile("system.log", "ERROR", format, v...) }
+
+// Service specific logs (port_xxxx.log)
+func (s *ProxyService) warnLog(format string, v ...interface{}) {
+	writeToLogFile(fmt.Sprintf("port_%s.log", s.Port), "WARN", format, v...)
+}
+func (s *ProxyService) infoLog(format string, v ...interface{}) {
+	writeToLogFile(fmt.Sprintf("port_%s.log", s.Port), "INFO", format, v...)
+}
+
+// --- CORE LOGIC ---
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   TCP PROXY - LOCAL SCOPED LIMITS 2025")
+	fmt.Println("   TCP PROXY - LOCAL LIMITS & LOGGING")
 	fmt.Println("===========================================")
 
 	initTemplate()
@@ -254,19 +293,17 @@ func (s *ProxyService) startProxy() {
 	ln, err := net.Listen("tcp4", "0.0.0.0:"+s.Port)
 	if err != nil { s.mux.Lock(); s.ErrorMsg = "Port in use"; s.mux.Unlock(); return }
 	s.mux.Lock(); s.Listener = ln; s.ErrorMsg = ""; s.mux.Unlock()
-	infoLog("Proxy [%s] running on port %s (%s)", s.Name, s.Port, s.Protocol)
+	s.infoLog("Proxy running on port %s (%s)", s.Port, s.Protocol)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil { return }
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-		// --- CẢI TIẾN: SỬ DỤNG PHẠM VI CỤC BỘ (LOCAL) CHO TỪNG PROXY ---
-
 		// 1. LOCAL PENALTY BOX
 		if ban, blocked := s.PenaltyBox.Load(ip); blocked {
 			if time.Now().Before(ban.(time.Time)) {
-				warnLog("[%s] Block IP %s: Still in Local Penalty Box", s.Name, ip)
+				s.warnLog("Block IP %s: Still in Local Penalty Box", ip)
 				conn.Close(); continue
 			}
 			s.PenaltyBox.Delete(ip)
@@ -281,7 +318,7 @@ func (s *ProxyService) startProxy() {
 		} else {
 			if atomic.AddInt32(&stat.count, 1) > atomic.LoadInt32(&connRateLimit) {
 				p := time.Duration(atomic.LoadInt64(&penaltyDurationNS))
-				warnLog("[%s] Block IP %s: Local Rate limit exceeded (Penalty: %v)", s.Name, ip, p)
+				s.warnLog("Block IP %s: Local Rate limit exceeded (Penalty: %v)", ip, p)
 				s.PenaltyBox.Store(ip, time.Now().Add(p))
 				atomic.StoreInt32(&stat.count, 0)
 				stat.lastReset = time.Now()
@@ -293,14 +330,14 @@ func (s *ProxyService) startProxy() {
 		valIP, _ := s.IPMap.LoadOrStore(ip, new(int32))
 		activeIPCounter := valIP.(*int32)
 		if atomic.AddInt32(activeIPCounter, 1) > atomic.LoadInt32(&MaxConnsPerIP) {
-			warnLog("[%s] Block IP %s: Reached Local MaxConnsPerIP (%d)", s.Name, ip, atomic.LoadInt32(&MaxConnsPerIP))
+			s.warnLog("Block IP %s: Reached Local MaxConnsPerIP (%d)", ip, atomic.LoadInt32(&MaxConnsPerIP))
 			atomic.AddInt32(activeIPCounter, -1)
 			conn.Close(); continue
 		}
 
-		// 4. GLOBAL LIMIT (Vẫn giữ nguyên vì đây là tài nguyên máy chủ tổng)
+		// 4. GLOBAL LIMIT
 		if atomic.LoadInt64(&totalActiveConns) >= atomic.LoadInt64(&MaxGlobalConns) {
-			warnLog("Block connection: Global limit reached (%d)", atomic.LoadInt64(&MaxGlobalConns))
+			errLog("Block connection: Global limit reached (%d)", atomic.LoadInt64(&MaxGlobalConns))
 			atomic.AddInt32(activeIPCounter, -1)
 			conn.Close(); continue
 		}
@@ -311,31 +348,19 @@ func (s *ProxyService) startProxy() {
 	}
 }
 
-// ... (Các hàm khác: checkBackendsOnce, startHealthCheck, handleConnection, stop, getNextAliveBackend, watchConfigFile, startMonitorServer GIỮ NGUYÊN) ...
-
-func (s *ProxyService) checkBackendsOnce() {
-	s.mux.RLock(); backends := s.Backends; s.mux.RUnlock()
-	for _, b := range backends {
-		conn, err := net.DialTimeout("tcp", b.Address, 1*time.Second)
-		b.mux.Lock(); b.Alive = (err == nil); if err == nil { conn.Close() }; b.mux.Unlock()
-	}
-}
-func (s *ProxyService) startHealthCheck() {
-	for {
-		interval := time.Duration(atomic.LoadInt64(&healthCheckIntervalNS))
-		if interval < 1*time.Second { interval = 3 * time.Second }; time.Sleep(interval)
-		select { case <-s.quit: return; default: s.checkBackendsOnce() }
-	}
-}
 func (s *ProxyService) handleConnection(clientConn net.Conn, ipCounter *int32) {
 	defer func() {
-		if r := recover(); r != nil { errLog("Panic: %v", r) }; clientConn.Close()
-		atomic.AddInt64(&totalActiveConns, -1); atomic.AddInt64(&s.CurrentConns, -1)
+		if r := recover(); r != nil { s.warnLog("Panic: %v", r) }
+		clientConn.Close()
+		atomic.AddInt64(&totalActiveConns, -1)
+		atomic.AddInt64(&s.CurrentConns, -1)
 		if ipCounter != nil { atomic.AddInt32(ipCounter, -1) }
 	}()
 	s.mux.RLock(); proto, backend := s.Protocol, s.getNextAliveBackend(); s.mux.RUnlock()
-	if backend == nil { return }; targetConn, err := net.DialTimeout("tcp", backend.Address, 5*time.Second)
-	if err != nil { return }; defer targetConn.Close()
+	if backend == nil { return }
+	targetConn, err := net.DialTimeout("tcp", backend.Address, 5*time.Second)
+	if err != nil { return }
+	defer targetConn.Close()
 	atomic.AddInt64(&backend.ActiveConns, 1); defer atomic.AddInt64(&backend.ActiveConns, -1)
 	var timeout time.Duration
 	if proto == "http" { timeout = time.Duration(atomic.LoadInt64(&idleTimeoutHTTPNS)) } else { timeout = time.Duration(atomic.LoadInt64(&idleTimeoutTCPNS)) }
@@ -344,6 +369,37 @@ func (s *ProxyService) handleConnection(clientConn net.Conn, ipCounter *int32) {
 		buf := bufPool.Get().([]byte); defer bufPool.Put(buf); io.CopyBuffer(dst, src, buf); done <- true
 	}
 	go cp(targetConn, &IdleTimeoutConn{clientConn, timeout}); go cp(clientConn, &IdleTimeoutConn{targetConn, timeout}); <-done
+}
+
+// --- REMAINING HELPERS (HealthCheck, Monitor, etc.) ---
+
+func (s *ProxyService) checkBackendsOnce() {
+	s.mux.RLock(); backends := s.Backends; s.mux.RUnlock()
+	for _, b := range backends {
+		conn, err := net.DialTimeout("tcp", b.Address, 1*time.Second)
+		isAliveNow := (err == nil)
+
+		b.mux.Lock()
+		if b.Alive != isAliveNow {
+			// Thêm s.Name vào nội dung log
+			if isAliveNow {
+				s.infoLog("[%s] BACKEND ONLINE: %s", s.Name, b.Address)
+			} else {
+				s.warnLog("[%s] BACKEND OFFLINE: %s", s.Name, b.Address)
+			}
+			b.Alive = isAliveNow
+		}
+		if err == nil { conn.Close() }
+		b.mux.Unlock()
+	}
+}
+
+func (s *ProxyService) startHealthCheck() {
+	for {
+		interval := time.Duration(atomic.LoadInt64(&healthCheckIntervalNS))
+		if interval < 1*time.Second { interval = 3 * time.Second }; time.Sleep(interval)
+		select { case <-s.quit: return; default: s.checkBackendsOnce() }
+	}
 }
 func (s *ProxyService) stop() {
 	s.mux.Lock(); defer s.mux.Unlock()
