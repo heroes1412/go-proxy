@@ -11,5 +11,7 @@ PenaltyDurationInSec  = 120  // Cấm 10s nếu vi phạm
 
 [proxy]
 port1|44405|192.168.2.193:44405|tcp
-port2|55901|192.168.2.193:55901,192.168.2.193:55901|tcp
+port2|55901|192.168.2.193:55901,192.168.2.193:44405|tcp|bypass
 port3|80|192.168.2.193:80|http
+
+//<name proxy> | <port in host server> | <list backend server,list backend server> | http or tcp | "bypass" policy : optional
