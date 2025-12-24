@@ -47,6 +47,7 @@ type ProxyService struct {
 	PenaltyBox   sync.Map
 	RateMap      sync.Map
 	mux          sync.RWMutex
+	BypassLimits bool // Field cho tham số bypass optional
 }
 
 type IdleTimeoutConn struct {
@@ -87,52 +88,44 @@ var (
 	sysCPUUsage uint64
 	sysRAMUsage uint64
 
-	logMutex sync.Mutex // Đảm bảo ghi file log không bị chồng chéo
+	logMutex sync.Mutex 
 )
 
 var bufPool = sync.Pool{
 	New: func() interface{} { return make([]byte, 32*1024) },
 }
 
-// --- LOGGING SYSTEM WITH AUTO-OVERRIDE (1MB) ---
+// --- LOGGING SYSTEM ---
 
 func writeToLogFile(fileName, level, format string, v ...interface{}) {
 	logMutex.Lock()
 	defer logMutex.Unlock()
 
-	// 1. Tạo folder logs nếu chưa có
 	os.MkdirAll("logs", 0755)
 	path := fmt.Sprintf("logs/%s", fileName)
 
-	// 2. Kiểm tra dung lượng file
 	if info, err := os.Stat(path); err == nil {
-		if info.Size() > 1024*1024 { // 1MB
-			// Override file nếu quá lớn
+		if info.Size() > 1024*1024 { 
 			os.OpenFile(path, os.O_TRUNC|os.O_WRONLY, 0644)
 		}
 	}
 
-	// 3. Mở file để ghi (Append)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	// 4. Định dạng log
 	t := time.Now().Format("15:04:05 02/01/2006")
 	msg := fmt.Sprintf("[%s] [%s] "+format+"\n", append([]interface{}{t, level}, v...)...)
 
-	// Ghi ra Console và File
 	fmt.Print(msg)
 	f.WriteString(msg)
 }
 
-// Global logs (system.log)
 func infoLog(format string, v ...interface{}) { writeToLogFile("system.log", "INFO", format, v...) }
 func errLog(format string, v ...interface{})  { writeToLogFile("system.log", "ERROR", format, v...) }
 
-// Service specific logs (port_xxxx.log)
 func (s *ProxyService) warnLog(format string, v ...interface{}) {
 	writeToLogFile(fmt.Sprintf("port_%s.log", s.Port), "WARN", format, v...)
 }
@@ -144,7 +137,7 @@ func (s *ProxyService) infoLog(format string, v ...interface{}) {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   TCP PROXY - LOCAL LIMITS & LOGGING")
+	fmt.Println("    TCP PROXY - LOCAL LIMITS & LOGGING")
 	fmt.Println("===========================================")
 
 	initTemplate()
@@ -153,71 +146,6 @@ func main() {
 	
 	startMonitorServer(CurrentMonitorPort)
 	select {}
-}
-
-func initTemplate() {
-	const html = `
-	<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Proxy Monitor</title><meta http-equiv="refresh" content="2">
-	<style>
-		body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
-		.container { max-width: 1000px; margin: auto; }
-		.sys-header { background: #1a73e8; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: 500; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-		.card { background: white; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
-		.header-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: #fff; border-bottom: 1px solid #eee; }
-		.progress-container { padding: 15px; border-bottom: 1px solid #eee; }
-		.progress-bar { background: #e9ecef; height: 14px; border-radius: 7px; overflow: hidden; margin-top: 8px; }
-		.progress-fill { background: linear-gradient(90deg, #1a73e8, #34a853); height: 100%; transition: width 0.5s ease; }
-		table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-		th { background: #f8f9fa; color: #666; font-size: 0.8em; text-transform: uppercase; padding: 10px 15px; text-align: left; }
-		td { padding: 12px 15px; border-bottom: 1px solid #f1f3f4; font-size: 0.95em; vertical-align: middle; }
-		.status-cell { width: 130px; }
-		.status-box { display: inline-flex; align-items: center; width: 110px; font-family: 'Consolas', 'Monaco', monospace; font-weight: bold; font-size: 0.9em; }
-		.dot { margin-right: 8px; font-size: 1.2em; }
-		.up { color: #28a745; } .down { color: #dc3545; }
-		.badge { background: #e8f0fe; color: #1a73e8; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; border: 1px solid #d2e3fc; }
-		.error-list { background: #fff; border-radius: 8px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-		.err-msg { color: #cf1322; background: #fff1f0; border: 1px solid #ffa39e; padding: 10px; border-radius: 5px; margin-bottom: 5px; }
-	</style></head>
-	<body><div class="container">
-		<div class="sys-header" style="padding:15px; display:flex; justify-content:space-between;">
-			<span>📈 App Usage: <b>{{printf "%.1f" .AppCPU}}%</b> Load | <b>{{printf "%.1f" .AppRAM}}</b> MB RAM</span>
-			<span>📈 System: <b>{{printf "%.1f" .SysCPU}}%</b> Load | <b>{{printf "%.1f" .SysRAM}}%</b> RAM</span>
-		</div>
-		<div class="card progress-container">
-			<div style="display:flex; justify-content:space-between; font-weight:bold;">
-				<span>Tổng kết nối toàn hệ thống</span><span>{{.TotalActive}} / {{.MaxGlobal}}</span>
-			</div>
-			<div class="progress-bar"><div class="progress-fill" style="width: {{multi .TotalActive .MaxGlobal}}%"></div></div>
-		</div>
-		<h2>🚀 Active Services</h2>
-		{{range .Services}}{{if not .ErrorMsg}}
-		<div class="card">
-			<div class="header-row"><span style="font-weight:bold;">{{.Name}} (Port: {{.Port}})</span><span class="badge">{{.Protocol}}</span></div>
-			<table><thead><tr><th width="50%">Backend</th><th class="status-cell">Status</th><th width="20%">Active</th></tr></thead>
-				<tbody>{{range .Backends}}<tr><td><code>{{.Address}}</code></td>
-				<td class="status-cell">{{if .Alive}} <span class="status-box up"><span class="dot">●</span>ONLINE</span>
-					{{else}} <span class="status-box down"><span class="dot">○</span>OFFLINE</span> {{end}}</td>
-				<td><strong>{{.ActiveConns}}</strong></td></tr>{{end}}</tbody>
-			</table>
-		</div>
-		{{end}}{{end}}
-		<h2>⚠️ Warnings</h2>
-		<div class="error-list">
-			{{$totalErrors := 0}}{{range .Services}}{{if .ErrorMsg}}{{$totalErrors = add $totalErrors 1}}<div class="err-msg"><strong>Port {{.Port}}</strong>: {{.ErrorMsg}}</div>{{end}}
-				{{range .Backends}}{{if not .Alive}}{{$totalErrors = add $totalErrors 1}}<div class="err-msg"><strong>Backend Offline</strong>: {{.Address}}</div>{{end}}{{end}}{{end}}
-			{{if eq $totalErrors 0}}<p style="color: #52c41a; font-weight: bold; margin:0;">● All systems operational.</p>{{end}}
-		</div>
-	</div></body></html>`
-
-	mainTmpl = template.Must(template.New("m").Funcs(template.FuncMap{
-		"multi": func(curr, max int64) float64 {
-			if max <= 0 { return 0 }
-			val := float64(curr) / float64(max) * 100
-			if val > 100 { return 100 }
-			return val
-		},
-		"add": func(a, b int) int { return a + b },
-	}).Parse(html))
 }
 
 func reloadConfig(isInitial bool) {
@@ -258,22 +186,30 @@ func reloadConfig(isInitial bool) {
 			name, port, bAddr := parts[0], parts[1], parts[2]
 			proto := "tcp"
 			if len(parts) >= 4 { proto = strings.ToLower(strings.TrimSpace(parts[3])) }
+			
+			// Tham số thứ 5 là optional bypass
+			isBypass := false
+			if len(parts) >= 5 && strings.TrimSpace(strings.ToLower(parts[4])) == "bypass" {
+				isBypass = true
+			}
+
 			newPorts[port] = true
 			if svc, exists := services[port]; exists {
 				svc.mux.Lock()
-				svc.Name, svc.Protocol = name, proto
+				svc.Name, svc.Protocol, svc.BypassLimits = name, proto, isBypass
 				oMap := make(map[string]*Backend)
 				for _, b := range svc.Backends { oMap[b.Address] = b }
 				var updated []*Backend
 				for _, a := range strings.Split(bAddr, ",") {
-					if oldB, ok := oMap[a]; ok { updated = append(updated, oldB) } else { updated = append(updated, &Backend{Address: a, Alive: false}) }
+					addr := strings.TrimSpace(a)
+					if oldB, ok := oMap[addr]; ok { updated = append(updated, oldB) } else { updated = append(updated, &Backend{Address: addr, Alive: false}) }
 				}
 				svc.Backends = updated
 				if svc.ErrorMsg != "" { go svc.startProxy() }
 				svc.mux.Unlock()
 			} else {
-				newSvc := &ProxyService{Name: name, Port: port, Protocol: proto, quit: make(chan bool)}
-				for _, a := range strings.Split(bAddr, ",") { newSvc.Backends = append(newSvc.Backends, &Backend{Address: a, Alive: false}) }
+				newSvc := &ProxyService{Name: name, Port: port, Protocol: proto, BypassLimits: isBypass, quit: make(chan bool)}
+				for _, a := range strings.Split(bAddr, ",") { newSvc.Backends = append(newSvc.Backends, &Backend{Address: strings.TrimSpace(a), Alive: false}) }
 				services[port] = newSvc
 				go newSvc.startProxy()
 				go newSvc.startHealthCheck()
@@ -293,52 +229,56 @@ func (s *ProxyService) startProxy() {
 	ln, err := net.Listen("tcp4", "0.0.0.0:"+s.Port)
 	if err != nil { s.mux.Lock(); s.ErrorMsg = "Port in use"; s.mux.Unlock(); return }
 	s.mux.Lock(); s.Listener = ln; s.ErrorMsg = ""; s.mux.Unlock()
-	s.infoLog("Proxy running on port %s (%s)", s.Port, s.Protocol)
+	s.infoLog("Proxy %s running on port %s (Protocol: %s, Bypass: %v)", s.Name, s.Port, s.Protocol, s.BypassLimits)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil { return }
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-		// 1. LOCAL PENALTY BOX
-		if ban, blocked := s.PenaltyBox.Load(ip); blocked {
-			if time.Now().Before(ban.(time.Time)) {
-				s.warnLog("Block IP %s: Still in Local Penalty Box", ip)
+		var activeIPCounter *int32
+
+		if !s.BypassLimits {
+			// 1. LOCAL PENALTY BOX
+			if ban, blocked := s.PenaltyBox.Load(ip); blocked {
+				if time.Now().Before(ban.(time.Time)) {
+					s.warnLog("[%s] Block IP %s: Still in Local Penalty Box", s.Name, ip)
+					conn.Close(); continue
+				}
+				s.PenaltyBox.Delete(ip)
+			}
+
+			// 2. LOCAL RATE LIMIT
+			v, _ := s.RateMap.LoadOrStore(ip, &IPStat{lastReset: time.Now()})
+			stat := v.(*IPStat)
+			window := time.Duration(atomic.LoadInt64(&connRateWindowNS))
+			if time.Since(stat.lastReset) > window {
+				atomic.StoreInt32(&stat.count, 1); stat.lastReset = time.Now()
+			} else {
+				if atomic.AddInt32(&stat.count, 1) > atomic.LoadInt32(&connRateLimit) {
+					p := time.Duration(atomic.LoadInt64(&penaltyDurationNS))
+					s.warnLog("[%s] Block IP %s: Local Rate limit exceeded", s.Name, ip)
+					s.PenaltyBox.Store(ip, time.Now().Add(p))
+					atomic.StoreInt32(&stat.count, 0)
+					stat.lastReset = time.Now()
+					conn.Close(); continue
+				}
+			}
+
+			// 3. LOCAL MAX CONNS PER IP
+			valIP, _ := s.IPMap.LoadOrStore(ip, new(int32))
+			activeIPCounter = valIP.(*int32)
+			if atomic.AddInt32(activeIPCounter, 1) > atomic.LoadInt32(&MaxConnsPerIP) {
+				s.warnLog("[%s] Block IP %s: Reached Local MaxConnsPerIP (%d)", s.Name, ip, atomic.LoadInt32(&MaxConnsPerIP))
+				atomic.AddInt32(activeIPCounter, -1)
 				conn.Close(); continue
 			}
-			s.PenaltyBox.Delete(ip)
-		}
-
-		// 2. LOCAL RATE LIMIT
-		v, _ := s.RateMap.LoadOrStore(ip, &IPStat{lastReset: time.Now()})
-		stat := v.(*IPStat)
-		window := time.Duration(atomic.LoadInt64(&connRateWindowNS))
-		if time.Since(stat.lastReset) > window {
-			atomic.StoreInt32(&stat.count, 1); stat.lastReset = time.Now()
-		} else {
-			if atomic.AddInt32(&stat.count, 1) > atomic.LoadInt32(&connRateLimit) {
-				p := time.Duration(atomic.LoadInt64(&penaltyDurationNS))
-				s.warnLog("Block IP %s: Local Rate limit exceeded (Penalty: %v)", ip, p)
-				s.PenaltyBox.Store(ip, time.Now().Add(p))
-				atomic.StoreInt32(&stat.count, 0)
-				stat.lastReset = time.Now()
-				conn.Close(); continue
-			}
-		}
-
-		// 3. LOCAL MAX CONNS PER IP
-		valIP, _ := s.IPMap.LoadOrStore(ip, new(int32))
-		activeIPCounter := valIP.(*int32)
-		if atomic.AddInt32(activeIPCounter, 1) > atomic.LoadInt32(&MaxConnsPerIP) {
-			s.warnLog("Block IP %s: Reached Local MaxConnsPerIP (%d)", ip, atomic.LoadInt32(&MaxConnsPerIP))
-			atomic.AddInt32(activeIPCounter, -1)
-			conn.Close(); continue
 		}
 
 		// 4. GLOBAL LIMIT
 		if atomic.LoadInt64(&totalActiveConns) >= atomic.LoadInt64(&MaxGlobalConns) {
 			errLog("Block connection: Global limit reached (%d)", atomic.LoadInt64(&MaxGlobalConns))
-			atomic.AddInt32(activeIPCounter, -1)
+			if activeIPCounter != nil { atomic.AddInt32(activeIPCounter, -1) }
 			conn.Close(); continue
 		}
 
@@ -371,7 +311,7 @@ func (s *ProxyService) handleConnection(clientConn net.Conn, ipCounter *int32) {
 	go cp(targetConn, &IdleTimeoutConn{clientConn, timeout}); go cp(clientConn, &IdleTimeoutConn{targetConn, timeout}); <-done
 }
 
-// --- REMAINING HELPERS (HealthCheck, Monitor, etc.) ---
+// --- HELPERS ---
 
 func (s *ProxyService) checkBackendsOnce() {
 	s.mux.RLock(); backends := s.Backends; s.mux.RUnlock()
@@ -381,7 +321,6 @@ func (s *ProxyService) checkBackendsOnce() {
 
 		b.mux.Lock()
 		if b.Alive != isAliveNow {
-			// Thêm s.Name vào nội dung log
 			if isAliveNow {
 				s.infoLog("[%s] BACKEND ONLINE: %s", s.Name, b.Address)
 			} else {
@@ -393,7 +332,6 @@ func (s *ProxyService) checkBackendsOnce() {
 		b.mux.Unlock()
 	}
 }
-
 func (s *ProxyService) startHealthCheck() {
 	for {
 		interval := time.Duration(atomic.LoadInt64(&healthCheckIntervalNS))
@@ -422,11 +360,13 @@ func watchConfigFile() {
 		if err == nil { globalMux.Lock(); if info.ModTime().After(lastModTime) { globalMux.Unlock(); reloadConfig(false) } else { globalMux.Unlock() } }
 	}
 }
+
 func startMonitorServer(port string) {
 	if monitorServer != nil { monitorServer.Shutdown(context.Background()) }
 	go func() {
 		var lastAppTime time.Duration; var lastSysIdle, lastSysKernel, lastSysUser uint64
 		for {
+			// Hàm này được định nghĩa trong stats_windows.go hoặc stats_linux.go
 			aCPU, sCPU, sRAM := collectOSStats(&lastAppTime, &lastSysIdle, &lastSysKernel, &lastSysUser)
 			atomic.StoreUint64(&appCPUUsage, *(*uint64)(unsafe.Pointer(&aCPU))); atomic.StoreUint64(&sysCPUUsage, *(*uint64)(unsafe.Pointer(&sCPU)))
 			atomic.StoreUint64(&sysRAMUsage, *(*uint64)(unsafe.Pointer(&sRAM))); time.Sleep(2 * time.Second)
@@ -438,4 +378,59 @@ func startMonitorServer(port string) {
 		data := struct { Services map[string]*ProxyService; MaxGlobal int64; TotalActive int64; AppCPU float64; AppRAM float64; SysCPU float64; SysRAM float64 }{services, atomic.LoadInt64(&MaxGlobalConns), atomic.LoadInt64(&totalActiveConns), aCPU, float64(m.Alloc) / 1024 / 1024, sCPU, sRAM}
 		mainTmpl.Execute(w, data)
 	}); monitorServer = &http.Server{Addr: ":" + port, Handler: mux}; log.Fatal(monitorServer.ListenAndServe())
+}
+
+func initTemplate() {
+	const html = `
+	<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Proxy Monitor</title><meta http-equiv="refresh" content="2">
+	<style>
+		body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+		.container { max-width: 1000px; margin: auto; }
+		.sys-header { background: #1a73e8; color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: 500; }
+		.card { background: white; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
+		.header-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 15px; background: #fff; border-bottom: 1px solid #eee; }
+		.progress-bar { background: #e9ecef; height: 14px; border-radius: 7px; overflow: hidden; margin-top: 8px; }
+		.progress-fill { background: linear-gradient(90deg, #1a73e8, #34a853); height: 100%; transition: width 0.5s ease; }
+		table { width: 100%; border-collapse: collapse; }
+		th { background: #f8f9fa; color: #666; font-size: 0.8em; text-transform: uppercase; padding: 10px; text-align: left; }
+		td { padding: 10px; border-bottom: 1px solid #f1f3f4; font-size: 0.95em; }
+		.up { color: #28a745; font-weight: bold; } .down { color: #dc3545; font-weight: bold; }
+		.badge { background: #e8f0fe; color: #1a73e8; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }
+	</style></head>
+	<body><div class="container">
+		<div class="sys-header" style="padding:15px; display:flex; justify-content:space-between;">
+			<span>📈 App Usage: <b>{{printf "%.1f" .AppCPU}}%</b> Load | <b>{{printf "%.1f" .AppRAM}}</b> MB RAM</span>
+			<span>📈 System: <b>{{printf "%.1f" .SysCPU}}%</b> Load | <b>{{printf "%.1f" .SysRAM}}%</b> RAM</span>
+		</div>
+		<div class="card" style="padding: 15px;">
+			<div style="display:flex; justify-content:space-between; font-weight:bold;">
+				<span>Tổng kết nối toàn hệ thống</span><span>{{.TotalActive}} / {{.MaxGlobal}}</span>
+			</div>
+			<div class="progress-bar"><div class="progress-fill" style="width: {{multi .TotalActive .MaxGlobal}}%"></div></div>
+		</div>
+		<h2>🚀 Active Services</h2>
+		{{range .Services}}{{if not .ErrorMsg}}
+		<div class="card">
+			<div class="header-row">
+				<span style="font-weight:bold;">{{.Name}} (Port: {{.Port}}) {{if .BypassLimits}}<small style="color:orange;">[BYPASS]</small>{{end}}</span>
+				<span class="badge">{{.Protocol}}</span>
+			</div>
+			<table><thead><tr><th width="50%">Backend</th><th width="30%">Status</th><th width="20%">Active</th></tr></thead>
+				<tbody>{{range .Backends}}<tr><td><code>{{.Address}}</code></td>
+				<td>{{if .Alive}} <span class="up">● ONLINE</span> {{else}} <span class="down">○ OFFLINE</span> {{end}}</td>
+				<td><strong>{{.ActiveConns}}</strong></td></tr>{{end}}</tbody>
+			</table>
+		</div>
+		{{end}}{{end}}
+	</div></body></html>`
+
+	mainTmpl = template.Must(template.New("m").Funcs(template.FuncMap{
+		"multi": func(curr, max int64) float64 {
+			if max <= 0 { return 0 }
+			val := float64(curr) / float64(max) * 100
+			if val > 100 { return 100 }
+			return val
+		},
+		"add": func(a, b int) int { return a + b },
+	}).Parse(html))
 }
