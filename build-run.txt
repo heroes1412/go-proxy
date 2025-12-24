@@ -1,6 +1,7 @@
 go mod init go-proxy
+go mod tidy
 #build
-go build -o proxy
-
+go build -o go-proxy.exe
+go build -o go-proxy
 #run
 go run .
