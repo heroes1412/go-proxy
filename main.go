@@ -43,7 +43,11 @@ type ProxyService struct {
 	Listener     net.Listener
 	quit         chan bool
 	CurrentConns int64
-	IPMap        sync.Map
+	// --- CÁC BẢN CỐ ĐỊNH CỤC BỘ ---
+	IPMap        sync.Map // Giới hạn kết nối đồng thời (MaxConnsPerIP)
+	PenaltyBox   sync.Map // Danh sách cấm tạm thời của riêng Port này
+	RateMap      sync.Map // Bộ đếm tần suất của riêng Port này
+	// ---------------------------
 	mux          sync.RWMutex
 }
 
@@ -78,8 +82,6 @@ var (
 	lastModTime            time.Time
 	configFileName         = "config.txt"
 	services               = make(map[string]*ProxyService)
-	penaltyBox             sync.Map
-	rateMap                sync.Map
 	mainTmpl               *template.Template
 	totalActiveConns       int64
 
@@ -103,7 +105,7 @@ func logWithLevel(level, format string, v ...interface{}) {
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("   TCP PROXY - PRODUCTION ULTIMATE 2025")
+	fmt.Println("   TCP PROXY - LOCAL SCOPED LIMITS 2025")
 	fmt.Println("===========================================")
 
 	initTemplate()
@@ -259,17 +261,19 @@ func (s *ProxyService) startProxy() {
 		if err != nil { return }
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-		// 1. PENALTY BOX LOG
-		if ban, blocked := penaltyBox.Load(ip); blocked {
+		// --- CẢI TIẾN: SỬ DỤNG PHẠM VI CỤC BỘ (LOCAL) CHO TỪNG PROXY ---
+
+		// 1. LOCAL PENALTY BOX
+		if ban, blocked := s.PenaltyBox.Load(ip); blocked {
 			if time.Now().Before(ban.(time.Time)) {
-				warnLog("Block IP %s: Still in Penalty Box", ip) // Khôi phục log
+				warnLog("[%s] Block IP %s: Still in Local Penalty Box", s.Name, ip)
 				conn.Close(); continue
 			}
-			penaltyBox.Delete(ip)
+			s.PenaltyBox.Delete(ip)
 		}
 
-		// 2. RATE LIMIT LOG
-		v, _ := rateMap.LoadOrStore(ip, &IPStat{lastReset: time.Now()})
+		// 2. LOCAL RATE LIMIT
+		v, _ := s.RateMap.LoadOrStore(ip, &IPStat{lastReset: time.Now()})
 		stat := v.(*IPStat)
 		window := time.Duration(atomic.LoadInt64(&connRateWindowNS))
 		if time.Since(stat.lastReset) > window {
@@ -277,26 +281,26 @@ func (s *ProxyService) startProxy() {
 		} else {
 			if atomic.AddInt32(&stat.count, 1) > atomic.LoadInt32(&connRateLimit) {
 				p := time.Duration(atomic.LoadInt64(&penaltyDurationNS))
-				warnLog("Block IP %s: Rate limit exceeded (Penalty: %v)", ip, p) // Khôi phục log
-				penaltyBox.Store(ip, time.Now().Add(p))
+				warnLog("[%s] Block IP %s: Local Rate limit exceeded (Penalty: %v)", s.Name, ip, p)
+				s.PenaltyBox.Store(ip, time.Now().Add(p))
 				atomic.StoreInt32(&stat.count, 0)
 				stat.lastReset = time.Now()
 				conn.Close(); continue
 			}
 		}
 
-		// 3. MAX CONNS PER IP LOG
+		// 3. LOCAL MAX CONNS PER IP
 		valIP, _ := s.IPMap.LoadOrStore(ip, new(int32))
 		activeIPCounter := valIP.(*int32)
 		if atomic.AddInt32(activeIPCounter, 1) > atomic.LoadInt32(&MaxConnsPerIP) {
-			warnLog("Block IP %s: Reached MaxConnsPerIP (%d)", ip, atomic.LoadInt32(&MaxConnsPerIP)) // Khôi phục log
+			warnLog("[%s] Block IP %s: Reached Local MaxConnsPerIP (%d)", s.Name, ip, atomic.LoadInt32(&MaxConnsPerIP))
 			atomic.AddInt32(activeIPCounter, -1)
 			conn.Close(); continue
 		}
 
-		// 4. GLOBAL LIMIT LOG
+		// 4. GLOBAL LIMIT (Vẫn giữ nguyên vì đây là tài nguyên máy chủ tổng)
 		if atomic.LoadInt64(&totalActiveConns) >= atomic.LoadInt64(&MaxGlobalConns) {
-			warnLog("Block connection: Global limit reached (%d)", atomic.LoadInt64(&MaxGlobalConns)) // Khôi phục log
+			warnLog("Block connection: Global limit reached (%d)", atomic.LoadInt64(&MaxGlobalConns))
 			atomic.AddInt32(activeIPCounter, -1)
 			conn.Close(); continue
 		}
