@@ -1,0 +1,6 @@
+go mod init go-proxy
+#build
+go build -o proxy
+
+#run
+go run .
