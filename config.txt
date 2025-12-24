@@ -1,13 +1,13 @@
 [global]
 MonitorPort = 55555
-MaxTotalConnsPerService = 2000 // Max connections per service
+MaxTotalConnsPerService = 3000 // Max connections per service
 HealthCheckInternal = 3 // sec
-MaxConnsPerIP = 50 // Max connections per single IP
+MaxConnsPerIP = 50 // Max connections per single IP, per proxy
 IdleTimeoutHTTPInSec = 60 // sec
 IdleTimeoutTCPInSec = 660 // sec
-ConnRateLimit    = 10            // Tối đa 10 lần kết nối mới...
-ConnRateWindowInSec   = 5  // ...trong vòng 5 giây
-PenaltyDurationInSec  = 300  // Cấm 5 phút nếu vi phạm
+ConnRateLimit    = 10            // Tối đa 3 lần kết nối mới...
+ConnRateWindowInSec   = 60  // ...trong vòng 60 giây
+PenaltyDurationInSec  = 120  // Cấm 10s nếu vi phạm
 
 [proxy]
 port1|44405|192.168.2.193:44405|tcp
