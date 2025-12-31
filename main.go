@@ -37,7 +37,7 @@ type IPStat struct {
 
 type Backend struct {
 	Address     string
-	Alive       bool
+	Status      int32 // 0: Unknown (WAITING), 1: Online, 2: Offline
 	ActiveConns int64
 	mux         sync.RWMutex
 }
@@ -57,6 +57,8 @@ type ProxyService struct {
 	RateMap      sync.Map
 	mux          sync.RWMutex
 	BypassLimits bool
+	BlindMode    bool
+	tasksStarted int32 // Cờ để đảm bảo chỉ chạy goroutine một lần
 }
 
 type IdleTimeoutConn struct {
@@ -73,18 +75,18 @@ func (c *IdleTimeoutConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// --- GLOBAL VARIABLES ---
+// --- GLOBAL VARIABLES & DEFAULTS ---
 
 var (
-	MaxGlobalConns        int64         = 2000
-	MaxConnsPerIP         int32         = 50
-	ConsoleDebug          int64         = 0 
+	MaxGlobalConns        int64         = 1000
+	MaxConnsPerIP         int32         = 30
+	ConsoleDebug          int64         = 1 
 	JsonLog               int64         = 0 
 	idleTimeoutHTTPNS      int64         = int64(60 * time.Second)
 	idleTimeoutTCPNS       int64         = int64(660 * time.Second)
-	connRateLimit          int32         = 10
-	connRateWindowNS       int64         = int64(5 * time.Second)
-	penaltyDurationNS      int64         = int64(300 * time.Second)
+	connRateLimit          int32         = 20
+	connRateWindowNS       int64         = int64(60 * time.Second)
+	penaltyDurationNS      int64         = int64(120 * time.Second)
 	healthCheckIntervalNS  int64         = int64(3 * time.Second)
 	CurrentMonitorPort     string        = "8080"
 	monitorServer          *http.Server
@@ -116,9 +118,7 @@ func writeToLogFile(fileName, level, proxyName, format string, v ...interface{})
 	path := fmt.Sprintf("logs/%s", fileName)
 
 	if info, err := os.Stat(path); err == nil {
-		if info.Size() > 1024*1024 {
-			os.OpenFile(path, os.O_TRUNC|os.O_WRONLY, 0644)
-		}
+		if info.Size() > 10*1024*1024 { os.OpenFile(path, os.O_TRUNC|os.O_WRONLY, 0644) }
 	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -153,12 +153,26 @@ func (s *ProxyService) infoLog(format string, v ...interface{}) {
 	writeToLogFile(fmt.Sprintf("port_%s.log", s.Port), "INFO", s.Name, format, v...)
 }
 
+// --- VALIDATION HELPERS ---
+
+func parseOrDefault(valStr string, def int64) int64 {
+	cleanStr := strings.TrimSpace(strings.Split(valStr, "//")[0])
+	val, err := strconv.ParseInt(cleanStr, 10, 64)
+	if err != nil { return def }
+	return val
+}
+
+func isValidPort(p string) bool {
+	port, err := strconv.Atoi(strings.TrimSpace(p))
+	return err == nil && port >= 1 && port <= 65534
+}
+
 // --- CORE LOGIC ---
 
 func main() {
 	fmt.Println("===========================================")
-	fmt.Println("    GO TCP PROXY🙈                         ")
-	fmt.Println("    https://github.com/heroes1412/go-proxy ")
+	fmt.Println("GO TCP PROXY - V5")
+	fmt.Println("https://github.com/heroes1412/go-proxy")
 	fmt.Println("===========================================")
 
 	initTemplate()
@@ -180,7 +194,7 @@ func reloadConfig(isInitial bool) {
 	
 	scanner := bufio.NewScanner(file)
 	section := ""
-	newPorts := make(map[string]bool)
+	newProxyKeys := make(map[string]bool)
 	oldMPort := CurrentMonitorPort
 	
 	for scanner.Scan() {
@@ -191,86 +205,125 @@ func reloadConfig(isInitial bool) {
 		if section == "[global]" {
 			parts := strings.Split(line, "=")
 			if len(parts) != 2 { continue }
-			key, valStr := strings.TrimSpace(parts[0]), strings.TrimSpace(strings.Split(parts[1], "//")[0])
-			if key == "MonitorPort" { CurrentMonitorPort = valStr; continue }
-			val, _ := strconv.ParseInt(valStr, 10, 64)
+			key, valStr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 			switch key {
-			case "JsonLog":                  atomic.StoreInt64(&JsonLog, val)
-			case "ConsoleDebug":             atomic.StoreInt64(&ConsoleDebug, val)
-			case "MaxTotalConnsPerService": atomic.StoreInt64(&MaxGlobalConns, val)
-			case "MaxConnsPerIP":           atomic.StoreInt32(&MaxConnsPerIP, int32(val))
-			case "IdleTimeoutHTTPInSec":     atomic.StoreInt64(&idleTimeoutHTTPNS, int64(time.Duration(val)*time.Second))
-			case "IdleTimeoutTCPInSec":      atomic.StoreInt64(&idleTimeoutTCPNS, int64(time.Duration(val)*time.Second))
-			case "ConnRateLimit":           atomic.StoreInt32(&connRateLimit, int32(val))
-			case "ConnRateWindowInSec":     atomic.StoreInt64(&connRateWindowNS, int64(time.Duration(val)*time.Second))
-			case "PenaltyDurationInSec":    atomic.StoreInt64(&penaltyDurationNS, int64(time.Duration(val)*time.Second))
-			case "HealthCheckInternal":     atomic.StoreInt64(&healthCheckIntervalNS, int64(time.Duration(val)*time.Second))
+			case "JsonLog":                  atomic.StoreInt64(&JsonLog, parseOrDefault(valStr, 0))
+			case "ConsoleDebug":             atomic.StoreInt64(&ConsoleDebug, parseOrDefault(valStr, 1))
+			case "MaxTotalConnsPerService": atomic.StoreInt64(&MaxGlobalConns, parseOrDefault(valStr, 1000))
+			case "MaxConnsPerIP":           atomic.StoreInt32(&MaxConnsPerIP, int32(parseOrDefault(valStr, 30)))
+			case "IdleTimeoutHTTPInSec":     atomic.StoreInt64(&idleTimeoutHTTPNS, parseOrDefault(valStr, 60)*int64(time.Second))
+			case "IdleTimeoutTCPInSec":      atomic.StoreInt64(&idleTimeoutTCPNS, parseOrDefault(valStr, 660)*int64(time.Second))
+			case "ConnRateLimit":           atomic.StoreInt32(&connRateLimit, int32(parseOrDefault(valStr, 20)))
+			case "ConnRateWindowInSec":     atomic.StoreInt64(&connRateWindowNS, parseOrDefault(valStr, 60)*int64(time.Second))
+			case "PenaltyDurationInSec":    atomic.StoreInt64(&penaltyDurationNS, parseOrDefault(valStr, 120)*int64(time.Second))
+			case "HealthCheckInternal":     atomic.StoreInt64(&healthCheckIntervalNS, parseOrDefault(valStr, 3)*int64(time.Second))
+			case "MonitorPort":             
+				cleanPort := strings.TrimSpace(strings.Split(valStr, "//")[0])
+				if _, err := strconv.Atoi(cleanPort); err == nil { CurrentMonitorPort = cleanPort } else { CurrentMonitorPort = "8080" }
 			}
 		} else if section == "[proxy]" {
 			parts := strings.Split(line, "|")
 			if len(parts) < 3 { continue }
+			
 			name, port, bAddr := parts[0], parts[1], parts[2]
-			proto := "tcp"
-			if len(parts) >= 4 { proto = strings.ToLower(strings.TrimSpace(parts[3])) }
-			isBypass := (len(parts) >= 5 && strings.TrimSpace(strings.ToLower(parts[4])) == "bypass")
+			configError := ""
 
-			newPorts[port] = true
-			if svc, exists := services[port]; exists {
+			if !isValidPort(port) {
+				configError = fmt.Sprintf("Invalid Listen Port: '%s' (1-65534)", port)
+				writeToLogFile("system.log", "ERROR", name, configError)
+			}
+
+			backendsRaw := strings.Split(bAddr, ",")
+			var cleanBackends []*Backend
+			if configError == "" {
+				for _, addr := range backendsRaw {
+					addr = strings.TrimSpace(addr)
+					_, bPort, err := net.SplitHostPort(addr)
+					if err != nil || !isValidPort(bPort) {
+						configError = fmt.Sprintf("Invalid Backend: '%s'", addr)
+						writeToLogFile("system.log", "ERROR", name, configError)
+						break
+					}
+					cleanBackends = append(cleanBackends, &Backend{Address: addr, Status: 0})
+				}
+			}
+
+			hasTCP, hasHTTP, isBypass, isBlind := false, false, false, false
+			for i := 3; i < len(parts); i++ {
+				p := strings.ToLower(strings.TrimSpace(parts[i]))
+				switch p {
+				case "tcp": hasTCP = true
+				case "http": hasHTTP = true
+				case "bypass": isBypass = true
+				case "blind": isBlind = true
+				}
+			}
+			proto := "tcp"
+			if hasTCP && hasHTTP {
+				writeToLogFile("system.log", "WARN", name, "Conflict flags. Defaulting to tcp.")
+			} else if hasHTTP { proto = "http" }
+
+			svcKey := name + ":" + port
+			newProxyKeys[svcKey] = true
+
+			if svc, exists := services[svcKey]; exists {
 				svc.mux.Lock()
-				svc.Name, svc.Protocol, svc.BypassLimits = name, proto, isBypass
-				oMap := make(map[string]*Backend)
-				for _, b := range svc.Backends { oMap[b.Address] = b }
-				var updated []*Backend
-				for _, a := range strings.Split(bAddr, ",") {
-					addr := strings.TrimSpace(a)
-					if oldB, ok := oMap[addr]; ok { updated = append(updated, oldB) } else { updated = append(updated, &Backend{Address: addr, Alive: true}) }
+				svc.Name, svc.Protocol, svc.BypassLimits, svc.BlindMode, svc.ErrorMsg = name, proto, isBypass, isBlind, configError
+				if configError == "" {
+					oMap := make(map[string]*Backend)
+					for _, b := range svc.Backends { oMap[b.Address] = b }
+					var updated []*Backend
+					for _, b := range cleanBackends {
+						if oldB, ok := oMap[b.Address]; ok { updated = append(updated, oldB) } else { updated = append(updated, b) }
+					}
+					svc.Backends = updated
 				}
-				svc.Backends = updated
-				if svc.ErrorMsg != "" { go svc.startProxy() }
 				svc.mux.Unlock()
+				if configError == "" { 
+					go svc.startProxy() 
+					svc.ensureTasksStarted() // Kích hoạt lại health check nếu trước đó bị lỗi
+				} else { svc.stop() }
 			} else {
-				newSvc := &ProxyService{Name: name, Port: port, Protocol: proto, BypassLimits: isBypass, quit: make(chan bool)}
-				for _, a := range strings.Split(bAddr, ",") { 
-					newSvc.Backends = append(newSvc.Backends, &Backend{Address: strings.TrimSpace(a), Alive: true}) 
+				newSvc := &ProxyService{Name: name, Port: port, Protocol: proto, BypassLimits: isBypass, BlindMode: isBlind, ErrorMsg: configError, quit: make(chan bool)}
+				newSvc.Backends = cleanBackends
+				services[svcKey] = newSvc
+				if configError == "" {
+					go newSvc.startProxy()
+					newSvc.ensureTasksStarted()
 				}
-				services[port] = newSvc
-				go newSvc.startProxy()
-				go newSvc.startHealthCheck()
-				go newSvc.startHousekeeping()
 			}
 		}
 	}
-
-	// Nếu Blind Mode, ép toàn bộ về ONLINE để UI đẹp
-	if atomic.LoadInt64(&healthCheckIntervalNS) <= 0 {
-		for _, svc := range services {
-			svc.mux.RLock()
-			for _, b := range svc.Backends { b.mux.Lock(); b.Alive = true; b.mux.Unlock() }
-			svc.mux.RUnlock()
-		}
-	}
-
 	if CurrentMonitorPort != oldMPort && !isInitial { go startMonitorServer(CurrentMonitorPort) }
-	for p, s := range services { if !newPorts[p] { s.stop(); delete(services, p) } }
+	for k, s := range services { if !newProxyKeys[k] { s.stop(); delete(services, k) } }
+}
+
+func (s *ProxyService) ensureTasksStarted() {
+	if atomic.CompareAndSwapInt32(&s.tasksStarted, 0, 1) {
+		go s.startHealthCheck()
+		go s.startHousekeeping()
+		if s.BlindMode { s.forceBackendsOnline() } else { go s.checkBackendsOnce() }
+	}
 }
 
 func (s *ProxyService) startProxy() {
 	s.mux.Lock()
-	if s.Listener != nil { s.mux.Unlock(); return }
+	if s.Listener != nil || s.ErrorMsg != "" { s.mux.Unlock(); return }
 	s.mux.Unlock()
 
-	// Pre-check Port
 	checkConn, err := net.DialTimeout("tcp", "127.0.0.1:"+s.Port, 500*time.Millisecond)
 	if err == nil {
 		checkConn.Close()
-		s.mux.Lock(); s.ErrorMsg = "Port already in use"; s.mux.Unlock()
+		s.mux.Lock(); s.ErrorMsg = "Port occupied by another app"; s.mux.Unlock()
 		writeToLogFile("system.log", "ERROR", s.Name, "CONFLICT: Port %s occupied", s.Port)
 		return
 	}
 
-	if atomic.LoadInt64(&healthCheckIntervalNS) > 0 { s.checkBackendsOnce() }
 	ln, err := net.Listen("tcp4", "0.0.0.0:"+s.Port)
-	if err != nil { s.mux.Lock(); s.ErrorMsg = "Port in use"; s.mux.Unlock(); return }
+	if err != nil { 
+		s.mux.Lock(); s.ErrorMsg = "Port binding failed"; s.mux.Unlock()
+		return 
+	}
 	s.mux.Lock(); s.Listener = ln; s.ErrorMsg = ""; s.mux.Unlock()
 	s.infoLog("Proxy online")
 
@@ -329,10 +382,10 @@ func (s *ProxyService) handleConnection(clientConn net.Conn, ipCounter *int32) {
 
 	targetConn, err := net.DialTimeout("tcp", backend.Address, 5*time.Second)
 	if err != nil {
-		if atomic.LoadInt64(&healthCheckIntervalNS) > 0 {
-			backend.mux.Lock()
-			if backend.Alive { backend.Alive = false; s.warnLog("BACKEND OFFLINE: %s", backend.Address) }
-			backend.mux.Unlock()
+		if !s.BlindMode {
+			if atomic.SwapInt32(&backend.Status, 2) != 2 {
+				s.warnLog("BACKEND OFFLINE (Dial failed): %s", backend.Address)
+			}
 		}
 		return
 	}
@@ -352,7 +405,55 @@ func (s *ProxyService) handleConnection(clientConn net.Conn, ipCounter *int32) {
 	<-done; <-done
 }
 
-// --- HELPERS ---
+func (s *ProxyService) checkBackendsOnce() {
+	s.mux.RLock(); isBlind, hasErr, backends := s.BlindMode, s.ErrorMsg != "", s.Backends; s.mux.RUnlock()
+	if isBlind || hasErr { return }
+	for _, b := range backends {
+		conn, err := net.DialTimeout("tcp", b.Address, 1*time.Second)
+		var currentStatus int32 = 2 // Offline
+		if err == nil { currentStatus = 1; conn.Close() }
+		if atomic.LoadInt32(&b.Status) != currentStatus {
+			if currentStatus == 1 { s.infoLog("BACKEND ONLINE: %s", b.Address) } else { s.warnLog("BACKEND OFFLINE: %s", b.Address) }
+			atomic.StoreInt32(&b.Status, currentStatus)
+		}
+	}
+}
+
+func (s *ProxyService) forceBackendsOnline() {
+	s.mux.RLock(); defer s.mux.RUnlock()
+	for _, b := range s.Backends { atomic.StoreInt32(&b.Status, 1) }
+}
+
+func (s *ProxyService) startHealthCheck() {
+	for {
+		s.mux.RLock(); isBlind, hasErr := s.BlindMode, s.ErrorMsg != ""; s.mux.RUnlock()
+		if isBlind || hasErr { time.Sleep(2 * time.Second); continue }
+		interval := time.Duration(atomic.LoadInt64(&healthCheckIntervalNS))
+		if interval <= 0 { time.Sleep(2 * time.Second); continue }
+		time.Sleep(interval)
+		select { case <-s.quit: return; default: s.checkBackendsOnce() }
+	}
+}
+
+func (s *ProxyService) stop() {
+	s.mux.Lock(); defer s.mux.Unlock()
+	if s.Listener != nil { s.Listener.Close(); s.Listener = nil }
+}
+
+func (s *ProxyService) getNextAliveBackend() *Backend {
+	s.mux.RLock(); defer s.mux.RUnlock()
+	if len(s.Backends) == 0 { return nil }
+	if s.BlindMode {
+		idx := atomic.AddUint64(&s.Index, 1) % uint64(len(s.Backends))
+		return s.Backends[idx]
+	}
+	for i := 0; i < len(s.Backends); i++ {
+		idx := atomic.AddUint64(&s.Index, 1) % uint64(len(s.Backends))
+		b := s.Backends[idx]
+		if atomic.LoadInt32(&b.Status) == 1 { return b }
+	}
+	return nil
+}
 
 func (s *ProxyService) startHousekeeping() {
 	ticker := time.NewTicker(5 * time.Minute)
@@ -366,61 +467,12 @@ func (s *ProxyService) startHousekeeping() {
 				if t, ok := v.(time.Time); ok && now.After(t) { s.PenaltyBox.Delete(k) }
 				return true
 			})
-			s.RateMap.Range(func(k, v interface{}) bool {
-				if st, ok := v.(*IPStat); ok && now.Sub(st.lastReset) > 10*time.Minute { s.RateMap.Delete(k) }
-				return true
-			})
 			s.IPMap.Range(func(k, v interface{}) bool {
 				if c, ok := v.(*int32); ok && atomic.LoadInt32(c) <= 0 { s.IPMap.Delete(k) }
 				return true
 			})
 		}
 	}
-}
-
-func (s *ProxyService) checkBackendsOnce() {
-	s.mux.RLock(); backends := s.Backends; s.mux.RUnlock()
-	for _, b := range backends {
-		conn, err := net.DialTimeout("tcp", b.Address, 1*time.Second)
-		isAliveNow := (err == nil)
-		b.mux.Lock()
-		if b.Alive != isAliveNow {
-			if isAliveNow { s.infoLog("BACKEND ONLINE: %s", b.Address) } else { s.warnLog("BACKEND OFFLINE: %s", b.Address) }
-			b.Alive = isAliveNow
-		}
-		if err == nil { conn.Close() }
-		b.mux.Unlock()
-	}
-}
-
-func (s *ProxyService) startHealthCheck() {
-	for {
-		interval := time.Duration(atomic.LoadInt64(&healthCheckIntervalNS))
-		if interval <= 0 { time.Sleep(2 * time.Second); continue }
-		time.Sleep(interval)
-		select { case <-s.quit: return; default: s.checkBackendsOnce() }
-	}
-}
-
-func (s *ProxyService) stop() {
-	s.mux.Lock(); defer s.mux.Unlock()
-	if s.Listener != nil { s.Listener.Close(); s.Listener = nil }
-	if s.quit != nil { select { case <-s.quit: default: close(s.quit) } }
-}
-
-func (s *ProxyService) getNextAliveBackend() *Backend {
-	s.mux.RLock(); defer s.mux.RUnlock()
-	if len(s.Backends) == 0 { return nil }
-	if atomic.LoadInt64(&healthCheckIntervalNS) <= 0 {
-		idx := atomic.AddUint64(&s.Index, 1) % uint64(len(s.Backends))
-		return s.Backends[idx]
-	}
-	for i := 0; i < len(s.Backends); i++ {
-		idx := atomic.AddUint64(&s.Index, 1) % uint64(len(s.Backends))
-		b := s.Backends[idx]; b.mux.RLock(); alive := b.Alive; b.mux.RUnlock()
-		if alive { return b }
-	}
-	return nil
 }
 
 func watchConfigFile() {
@@ -440,7 +492,6 @@ func startMonitorServer(port string) {
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		globalMux.Lock(); defer globalMux.Unlock()
@@ -451,12 +502,7 @@ func startMonitorServer(port string) {
 		for _, k := range sortedKeys { sortedServices = append(sortedServices, services[k]) }
 		var m runtime.MemStats; runtime.ReadMemStats(&m)
 		aCPU := *(*float64)(unsafe.Pointer(&appCPUUsage)); sCPU := *(*float64)(unsafe.Pointer(&sysCPUUsage)); sRAM := *(*float64)(unsafe.Pointer(&sysRAMUsage))
-		
-		data := struct { 
-			Services []*ProxyService
-			MaxGlobal int64; TotalActive int64; AppCPU float64; AppRAM float64; SysCPU float64; SysRAM float64
-			BlindMode bool // NEW: Truyền trạng thái Blind Mode vào UI
-		}{sortedServices, atomic.LoadInt64(&MaxGlobalConns), atomic.LoadInt64(&totalActiveConns), aCPU, float64(m.Alloc)/1024/1024, sCPU, sRAM, atomic.LoadInt64(&healthCheckIntervalNS) <= 0}
+		data := struct { Services []*ProxyService; MaxGlobal, TotalActive int64; AppCPU, AppRAM, SysCPU, SysRAM float64 }{sortedServices, atomic.LoadInt64(&MaxGlobalConns), atomic.LoadInt64(&totalActiveConns), aCPU, float64(m.Alloc)/1024/1024, sCPU, sRAM}
 		mainTmpl.Execute(w, data)
 	})
 	monitorServer = &http.Server{Addr: ":" + port, Handler: mux}
@@ -480,36 +526,40 @@ func initTemplate() {
 		th:nth-child(1), td:nth-child(1) { width: 40%; }
 		th:nth-child(2), td:nth-child(2) { width: 40%; }
 		th:nth-child(3), td:nth-child(3) { width: 20%; }
-		.status-box { display: inline-flex; align-items: center; width: 150px; font-family: 'Consolas', monospace; font-weight: bold; font-size: 0.9em; }
+		.status-box { display: inline-flex; align-items: center; width: 160px; font-family: 'Consolas', monospace; font-weight: bold; font-size: 0.9em; }
 		.dot { margin-right: 8px; font-size: 1.2em; }
 		.up { color: #28a745; } .down { color: #dc3545; }
-		.blind { color: #f39c12; }
+		.err-text { color: #dc3545; padding: 15px; font-weight: bold; background: #fff5f5; }
+		.blind-label { color: #f39c12; font-size: 0.85em; font-weight: normal; margin-left: 5px; }
 		.badge { background: #e8f0fe; color: #1a73e8; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }
 	</style></head>
 	<body><div class="container">
 		<div class="sys-header" style="display:flex; justify-content:space-between;">
-			<span>📈 App: <b>{{printf "%.1f" .AppCPU}}%</b> CPU | <b>{{printf "%.1f" .AppRAM}}</b> MB</span>
-			<span>📈 Sys: <b>{{printf "%.1f" .SysCPU}}%</b> CPU | <b>{{printf "%.1f" .SysRAM}}%</b> RAM</span>
+			<span>App: <b>{{printf "%.1f" .AppCPU}}%</b> CPU | <b>{{printf "%.1f" .AppRAM}}</b> MB</span>
+			<span>Sys: <b>{{printf "%.1f" .SysCPU}}%</b> CPU | <b>{{printf "%.1f" .SysRAM}}%</b> RAM</span>
 		</div>
 		<div class="card" style="padding: 15px;">
 			<div style="display:flex; justify-content:space-between; font-weight:bold;"><span>Total Connections</span><span>{{.TotalActive}} / {{.MaxGlobal}}</span></div>
 			<div class="progress-bar"><div class="progress-fill" style="width: {{multi .TotalActive .MaxGlobal}}%"></div></div>
 		</div>
-		{{$blind := .BlindMode}}{{range .Services}}
+		{{range .Services}}
 		<div class="card">
 			<div class="header-row">
-				<span style="font-weight:bold;">{{.Name}} (Port: {{.Port}}) {{if .BypassLimits}}<small style="color:orange;">[BYPASS]</small>{{end}}</span>
+				<span style="font-weight:bold;">{{.Name}} (Port: {{.Port}}) {{if .BypassLimits}}<span class="blind-label">(bypass-limit)</span>{{end}}</span>
 				<span class="badge">{{.Protocol}}</span>
 			</div>
-			{{if .ErrorMsg}}<div style="padding:15px; color:#dc3545; font-weight:bold;">⚠️ ERROR: {{.ErrorMsg}}</div>
+			{{if .ErrorMsg}}<div class="err-text">⚠️ CONFIG ERROR: {{.ErrorMsg}}</div>
 			{{else}}
 			<table><thead><tr><th>Backend</th><th>Status</th><th>Active</th></tr></thead>
-				<tbody>{{range .Backends}}<tr>
+				<tbody>{{$isBlindSvc := .BlindMode}}{{range .Backends}}<tr>
 					<td><code>{{.Address}}</code></td>
 					<td>
-						{{if $blind}}<span class="status-box up"><span class="dot">●</span>ONLINE 🙈</span>
-						{{else if .Alive}}<span class="status-box up"><span class="dot">●</span>ONLINE</span>
-						{{else}}<span class="status-box down"><span class="dot">○</span>OFFLINE</span>{{end}}
+						{{if $isBlindSvc}}<span class="status-box up"><span class="dot">●</span>ONLINE 🙈</span>
+						{{else}}{{$st := .Status}}
+							{{if eq $st 1}}<span class="status-box up"><span class="dot">●</span>ONLINE</span>
+							{{else if eq $st 2}}<span class="status-box down"><span class="dot">○</span>OFFLINE</span>
+							{{else}}<span class="status-box" style="color:#999;"><span class="dot">◌</span>WAITING</span>{{end}}
+						{{end}}
 					</td>
 					<td><strong>{{.ActiveConns}}</strong></td>
 				</tr>{{end}}</tbody>

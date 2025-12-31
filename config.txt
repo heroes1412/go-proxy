@@ -3,20 +3,21 @@ JsonLog                 = 0
 ConsoleDebug            = 1
 MonitorPort             = 55555
 MaxTotalConnsPerService = 1000 // Max connections, all connection
-HealthCheckInternal     = 0 // 0 for blind mode, just forward, 
+HealthCheckInternal     = 3 // sec 
 IdleTimeoutHTTPInSec    = 60 // sec
 IdleTimeoutTCPInSec     = 660 // sec
-MaxConnsPerIP           = 30 // Max connections per single IP, per proxy
-ConnRateLimit           = 10            // Tối đa 3 lần kết nối mới...
+MaxConnsPerIP           = 50 // Max connections per single IP, per proxy
+ConnRateLimit           = 20            // Tối đa 3 lần kết nối mới...
 ConnRateWindowInSec     = 60  // ...trong vòng 60 giây
 PenaltyDurationInSec    = 120  // Cấm 10s nếu vi phạm
 
 [proxy]
 44405|44405|192.168.2.193:44405|tcp
 55901|55901|192.168.2.193:55901|tcp
-5903|5903|192.168.2.193:5903|tcp
-port3|8088|192.168.2.193:80|http|bypass
-test-trial-lic|8080|192.168.2.200:8080|tcp
+55858|55858|192.168.2.193:55858|tcp|bypass
+port3|8088|192.168.2.193:44402,192.168.2.193:44403|http|bypass|áeas|ỉa|blind
 
-//<name proxy> | <port in host server> | <list backend server,list backend server> | http or tcp | "bypass" policy : optional
-//HealthCheckInternal = 0 // for blind mode
+//tham số 1,2,3 là cố định
+//các tham số tiếp theo có thể tcp|http|bypass|blind, linh tinh sẽ bỏ qua :D
+//bypass: bỏ qua MaxConnsPerIP, ConnRateLimit, ConnRateWindowInSec
+//blind: Không check backend
